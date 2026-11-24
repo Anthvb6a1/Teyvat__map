@@ -52,14 +52,23 @@ CACHE_ROOT = Path.home() / ".cache" / "teyvat_map"
 TILE_CACHE_DIR = CACHE_ROOT / str(MAP_ID)
 ANCHORS_CACHE = CACHE_ROOT / "anchors_cache.json.gz"
 CACHE_TTL = 24 * 3600
+USER_SETTINGS_FILE = CACHE_ROOT / "user_settings.json"
 
 BASE_DIR = Path(__file__).parent
 SPOT_KINDS_LOCAL = BASE_DIR / "spot_kinds.json"
 ICONS_FOLDER = BASE_DIR / "icons_data" / "icons"
 MARKER_PIN_PATH = BASE_DIR / "icons_data" / "marker_pin.png"
+UNDERGROUND_MARKER_URL = (
+    "https://webstatic.hoyoverse.com/upload/static-resource/2022/12/29/"
+    "65eebf6b7a8b5f4a86302f4c0ac9deca_5775722703419134293.png"
+)
+UNDERGROUND_MARKER_PATH = CACHE_ROOT / "underground_marker.png"
 MARKER_PIN_TIP_Y = 0.97
 MARKER_PIN_ICON_CENTER_Y = 0.38
 MARKER_PIN_ICON_SCALE = 0.52
+UNDERGROUND_MARKER_TIP_Y = 1.0
+UNDERGROUND_MARKER_ICON_CENTER_Y = 0.45
+UNDERGROUND_MARKER_ICON_SCALE = 0.50
 
 FALLBACK_VERSION = "bd70cde160dbd523926208d9fa8961a1"
 FALLBACK_TOTAL = (16384, 16384)
@@ -67,13 +76,36 @@ FALLBACK_MIN_Z = -6
 FALLBACK_MAX_Z = 0
 
 ICON_SIZES = {"far": 32, "mid": 48, "near": 64, "hi": 96}
+MARKER_SCALE = 0.85
+
+
+def load_user_settings():
+    try:
+        if USER_SETTINGS_FILE.exists():
+            data = json.loads(USER_SETTINGS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠️ Không đọc được cấu hình: {exc}")
+    return {}
+
+
+def save_user_settings(settings):
+    try:
+        USER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USER_SETTINGS_FILE.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"⚠️ Không lưu được cấu hình: {exc}")
 
 
 # ============================================================
 # MARKER + INDEX
 # ============================================================
 class Marker:
-    __slots__ = ("id", "label_id", "x", "y", "area_id", "icon_sign", "point_group")
+    __slots__ = ("id", "label_id", "x", "y", "area_id", "icon_sign",
+                 "point_group", "underground")
     def __init__(self, d):
         self.id = d.get("id")
         self.label_id = d.get("label_id", 0)
@@ -82,6 +114,21 @@ class Marker:
         self.area_id = d.get("area_id", 0)
         self.icon_sign = d.get("icon_sign", 0)
         self.point_group = d.get("point_group")
+        ext_attrs = d.get("ext_attrs_map") or {}
+        if not isinstance(ext_attrs, dict):
+            ext_attrs = {}
+        underground_value = (
+            d.get("Underground")
+            if "Underground" in d else d.get("underground")
+        )
+        if underground_value is None:
+            underground_value = ext_attrs.get("Underground",
+                                              ext_attrs.get("underground"))
+        self.underground = (
+            underground_value is True
+            or str(underground_value).strip().lower() == "true"
+            or self.point_group is not None
+        )
 
 
 class MarkerIndex:
@@ -467,8 +514,10 @@ class MapWidget(QWidget):
     MAX_TILE_CACHE = 800
     ZOOM_STEP = 0.25
 
-    def __init__(self, tile_base, total_size, origin, min_z, max_z, markers):
+    def __init__(self, tile_base, total_size, origin, min_z, max_z, markers,
+                 settings=None):
         super().__init__()
+        settings = settings or {}
         self.tile_base = tile_base
         self.total_size = total_size
         self.origin = origin
@@ -488,22 +537,38 @@ class MapWidget(QWidget):
         self.marker_pin = QPixmap(str(MARKER_PIN_PATH))
         if self.marker_pin.isNull():
             raise RuntimeError(f"Không tải được ảnh khung marker: {MARKER_PIN_PATH}")
+        self.underground_marker = QPixmap(str(UNDERGROUND_MARKER_PATH))
+        if self.underground_marker.isNull():
+            try:
+                UNDERGROUND_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+                r = requests.get(
+                    UNDERGROUND_MARKER_URL,
+                    headers=HEADERS,
+                    timeout=20,
+                )
+                r.raise_for_status()
+                UNDERGROUND_MARKER_PATH.write_bytes(r.content)
+                self.underground_marker = QPixmap(
+                    str(UNDERGROUND_MARKER_PATH))
+            except Exception as exc:
+                print(f"⚠️ Không tải được icon Underground: {exc}")
         self.icon_file_map = {}          # label_id → {file, url, name}
         self.icon_pixmap_cache = {}      # (label_id, size) → QPixmap
         self.marker_pixmap_cache = {}    # (label_id, size) → QPixmap
+        self.underground_pixmap_cache = {}
         self.icon_pending = set()        # label_id đang tải
         self.icon_failed = set()         # label_id tải fail
         self.label_color_cache = {}
         self.visible_label_ids = None
-        self.show_markers = True
-        self.show_underground = False
+        self.show_markers = settings.get("show_markers", True)
+        self.show_underground = settings.get("show_underground", False)
         self.hovered_marker = None
         self.visible_marker_count = 0
 
         # Anchors
         self.anchors_parent = []
         self.anchors_child = []
-        self.show_anchors = True
+        self.show_anchors = settings.get("show_anchors", True)
         self._font_cache = {}
 
         # Tiles
@@ -691,10 +756,11 @@ class MapWidget(QWidget):
     # ---------- Icons ----------
     def _pick_icon_size(self):
         z = self.zoom
-        if z <= -4: return ICON_SIZES["far"]
-        if z <= -2: return ICON_SIZES["mid"]
-        if z <= 0:  return ICON_SIZES["near"]
-        return ICON_SIZES["hi"]
+        if z <= -4: size = ICON_SIZES["far"]
+        elif z <= -2: size = ICON_SIZES["mid"]
+        elif z <= 0: size = ICON_SIZES["near"]
+        else: size = ICON_SIZES["hi"]
+        return max(1, round(size * MARKER_SCALE))
 
     def _get_icon_pixmap(self, label_id, size):
         info = self.icon_file_map.get(label_id)
@@ -753,6 +819,7 @@ class MapWidget(QWidget):
         for k in list(self.marker_pixmap_cache.keys()):
             if k[0] == label_id:
                 del self.marker_pixmap_cache[k]
+        self.underground_pixmap_cache.clear()
         self.update()
 
     def _get_fallback_pixmap(self, label_id, size):
@@ -802,6 +869,43 @@ class MapWidget(QWidget):
             self.marker_pixmap_cache[key] = marker
         return marker
 
+    def _get_underground_marker_pixmap(self, label_id, size):
+        key = (label_id, size)
+        if key in self.underground_pixmap_cache:
+            return self.underground_pixmap_cache[key]
+        if self.underground_marker.isNull():
+            return None
+
+        frame = self.underground_marker.scaled(
+            size,
+            size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        icon_size = max(1, round(frame.width() * UNDERGROUND_MARKER_ICON_SCALE))
+        icon = self._get_icon_pixmap(label_id, icon_size)
+        has_icon = icon is not None
+        if icon is None:
+            icon = self._get_fallback_pixmap(
+                label_id, max(6, icon_size // 2))
+
+        marker = QPixmap(frame.size())
+        marker.fill(Qt.transparent)
+        painter = QPainter(marker)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(0, 0, frame)
+        icon_x = (frame.width() - icon.width()) // 2
+        icon_y = round(
+            frame.height() * UNDERGROUND_MARKER_ICON_CENTER_Y
+            - icon.height() / 2
+        )
+        painter.drawPixmap(icon_x, icon_y, icon)
+        painter.end()
+
+        if has_icon:
+            self.underground_pixmap_cache[key] = marker
+        return marker
+
     # ---------- Paint markers ----------
     def _paint_markers(self, p, left, top, s):
         if not self.marker_index or not self.show_markers:
@@ -811,7 +915,7 @@ class MapWidget(QWidget):
         x0, y0, x1, y1 = self.viewport_bounds()
         candidates = self.marker_index.query(x0, y0, x1, y1)
         if not self.show_underground:
-            candidates = [m for m in candidates if m.point_group is None]
+            candidates = [m for m in candidates if not m.underground]
         if self.visible_label_ids is not None:
             candidates = [m for m in candidates
                           if m.label_id in self.visible_label_ids]
@@ -822,14 +926,26 @@ class MapWidget(QWidget):
             return
 
         icon_size = self._pick_icon_size()
-        if n > 3000: icon_size = min(icon_size, 24)
-        elif n > 1500: icon_size = min(icon_size, 32)
-        elif n > 600:  icon_size = min(icon_size, 40)
+        if n > 3000: icon_size = min(icon_size, round(24 * MARKER_SCALE))
+        elif n > 1500: icon_size = min(icon_size, round(32 * MARKER_SCALE))
+        elif n > 600:  icon_size = min(icon_size, round(40 * MARKER_SCALE))
 
         W, H = self.width(), self.height()
         for m in candidates:
             sx = (m.x - left) * s
             sy = (m.y - top) * s
+            if m.underground:
+                underground_pix = self._get_underground_marker_pixmap(
+                    m.label_id, icon_size)
+                if underground_pix is not None:
+                    pin_width = underground_pix.width()
+                    pin_left = sx - pin_width / 2
+                    pin_top = sy - underground_pix.height()
+                    if (pin_left > W or pin_left + pin_width < 0
+                            or pin_top > H or pin_top + underground_pix.height() < 0):
+                        continue
+                    p.drawPixmap(int(pin_left), int(pin_top), underground_pix)
+                    continue
             pin_width = max(1, round(icon_size * self.marker_pin.width()
                                       / self.marker_pin.height()))
             pin_left = sx - pin_width / 2
@@ -856,6 +972,8 @@ class MapWidget(QWidget):
     def _draw_tooltip(self, p, m, sx, sy):
         lines = [f"ID: {m.id}", f"Label: {m.label_id}",
                  f"Area: {m.area_id}", f"Pos: ({m.x:.0f}, {m.y:.0f})"]
+        if m.underground:
+            lines.append("Underground: True")
         if m.point_group:
             lines.append(f"Floor: {m.point_group.get('floor_id')}")
         info = self.icon_file_map.get(m.label_id)
@@ -1034,7 +1152,7 @@ class MapWidget(QWidget):
         x0, y0, x1, y1 = self.viewport_bounds()
         cand = self.marker_index.query(x0, y0, x1, y1)
         if not self.show_underground:
-            cand = [m for m in cand if m.point_group is None]
+            cand = [m for m in cand if not m.underground]
         if len(cand) > 8000:
             return
         s = 2 ** self.zoom
@@ -1110,14 +1228,23 @@ class MapWidget(QWidget):
             self.show_markers = not self.show_markers
             print(f"Markers: {'ON' if self.show_markers else 'OFF'}")
             self.update()
+            w = self.window()
+            if hasattr(w, "save_settings"):
+                w.save_settings()
         elif k == Qt.Key_U:
             self.show_underground = not self.show_underground
             print(f"Underground: {self.show_underground}")
             self.update()
+            w = self.window()
+            if hasattr(w, "save_settings"):
+                w.save_settings()
         elif k == Qt.Key_K:
             self.show_anchors = not self.show_anchors
             print(f"Anchors: {'ON' if self.show_anchors else 'OFF'}")
             self.update()
+            w = self.window()
+            if hasattr(w, "save_settings"):
+                w.save_settings()
         elif k == Qt.Key_R:
             print("🔄 Refreshing...")
             w = self.window()
@@ -1132,7 +1259,15 @@ class MapWindow(QWidget):
     def __init__(self, force_refresh=False):
         super().__init__()
         self.setWindowTitle("Teyvat Interactive Map Viewer")
-        self.resize(1440, 900)
+        self.settings = load_user_settings()
+        window_state = self.settings.get("window")
+        if (isinstance(window_state, list) and len(window_state) == 4
+                and all(isinstance(v, (int, float)) for v in window_state)):
+            x, y, width, height = window_state
+            self.resize(max(400, int(width)), max(300, int(height)))
+            self.move(int(x), int(y))
+        else:
+            self.resize(1440, 900)
 
         self.force_refresh = force_refresh
         self.meta_data = None
@@ -1148,6 +1283,23 @@ class MapWindow(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
 
         self._start_workers()
+
+    def save_settings(self):
+        if self.map_widget is not None:
+            self.settings["show_markers"] = self.map_widget.show_markers
+            self.settings["show_underground"] = self.map_widget.show_underground
+            self.settings["show_anchors"] = self.map_widget.show_anchors
+            self.settings["zoom"] = self.map_widget.zoom
+            self.settings["center"] = list(self.map_widget.center)
+        self.settings["visible_label_ids"] = sorted(self.visible_label_ids)
+        pos = self.pos()
+        size = self.size()
+        self.settings["window"] = [pos.x(), pos.y(), size.width(), size.height()]
+        save_user_settings(self.settings)
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
 
     def _start_workers(self):
         self.meta_worker = MetaWorker()
@@ -1214,16 +1366,34 @@ class MapWindow(QWidget):
 
         tile_base = TILE_BASE_FMT.format(map_id=MAP_ID, version=version)
         self.map_widget = MapWidget(tile_base, total, origin,
-                                    min_z, max_z, markers)
+                                    min_z, max_z, markers, self.settings)
         self.map_widget.set_icon_map(icon_map)
         self.map_widget.set_anchors(self.anchors_data)
         self.all_marker_label_ids = {marker.label_id for marker in markers}
-        self.visible_label_ids = set(self.all_marker_label_ids)
+        saved_ids = self.settings.get("visible_label_ids")
+        if isinstance(saved_ids, list):
+            saved_set = {int(v) for v in saved_ids if str(v).lstrip("-").isdigit()}
+            self.visible_label_ids = saved_set & self.all_marker_label_ids
+        else:
+            self.visible_label_ids = set(self.all_marker_label_ids)
         self.map_widget.set_visible_label_ids(self.visible_label_ids)
         self._layout.addWidget(self._build_icon_filter_panel(icon_map, markers))
         self._layout.addWidget(self.map_widget, 1)
         self.map_widget.setFocus()
-        QTimer.singleShot(50, self.map_widget.fit_to_window)
+        saved_zoom = self.settings.get("zoom")
+        saved_center = self.settings.get("center")
+        if (isinstance(saved_zoom, (int, float))
+                and isinstance(saved_center, list)
+                and len(saved_center) == 2
+                and all(isinstance(v, (int, float)) for v in saved_center)):
+            self.map_widget.zoom = max(
+                self.map_widget.min_zoom_ui,
+                min(self.map_widget.max_zoom_ui, float(saved_zoom)),
+            )
+            self.map_widget.center = (float(saved_center[0]), float(saved_center[1]))
+            self.map_widget.update()
+        else:
+            QTimer.singleShot(50, self.map_widget.fit_to_window)
 
     def _build_icon_filter_panel(self, icon_map, markers):
         panel = QWidget(self)
@@ -1270,6 +1440,11 @@ class MapWindow(QWidget):
         search = QLineEdit()
         search.setPlaceholderText("Tìm vật phẩm...")
         search.textChanged.connect(self._filter_icon_buttons)
+        search.textChanged.connect(
+            lambda text: self._save_filter_search(text))
+        saved_search = self.settings.get("filter_search", "")
+        if isinstance(saved_search, str) and saved_search:
+            search.setText(saved_search)
         layout.addWidget(search)
 
         scroll = QScrollArea(panel)
@@ -1365,6 +1540,7 @@ class MapWindow(QWidget):
         if self.map_widget is not None:
             self.map_widget.set_visible_label_ids(self.visible_label_ids)
         self._update_icon_filter_status()
+        self.save_settings()
 
     def _set_all_icon_filters(self, checked):
         self.visible_label_ids = (
@@ -1376,6 +1552,11 @@ class MapWindow(QWidget):
         if self.map_widget is not None:
             self.map_widget.set_visible_label_ids(self.visible_label_ids)
         self._update_icon_filter_status()
+        self.save_settings()
+
+    def _save_filter_search(self, text):
+        self.settings["filter_search"] = text
+        save_user_settings(self.settings)
 
     def _filter_icon_buttons(self, text):
         query = unicodedata.normalize("NFC", text.strip()).casefold()

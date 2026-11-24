@@ -15,7 +15,7 @@ Phím tắt:
     R  - nạp lại markers từ spot_kinds.json + refresh anchors
     Home - fit toàn map
 """
-import sys, math, json, time, gzip, re, argparse, unicodedata
+import sys, math, json, time, gzip, re, argparse, unicodedata, marshal
 from collections import Counter, OrderedDict
 from io import BytesIO
 from pathlib import Path
@@ -51,6 +51,8 @@ TILE_BASE_FMT = "https://act-webstatic.hoyoverse.com/map_manage/map/{map_id}/{ve
 CACHE_ROOT = Path.home() / ".cache" / "teyvat_map"
 TILE_CACHE_DIR = CACHE_ROOT / str(MAP_ID)
 ANCHORS_CACHE = CACHE_ROOT / "anchors_cache.json.gz"
+MARKERS_CACHE = CACHE_ROOT / "markers_cache.bin"
+LABELS_CACHE = CACHE_ROOT / "labels_cache.bin"
 CACHE_TTL = 24 * 3600
 USER_SETTINGS_FILE = CACHE_ROOT / "user_settings.json"
 
@@ -276,26 +278,58 @@ def build_label_icon_map():
         print(f"⚠️ Thiếu {SPOT_KINDS_LOCAL} → chấm màu")
         return {}
 
-    try:
-        raw = SPOT_KINDS_LOCAL.read_text(encoding="utf-8-sig")
-    except UnicodeDecodeError:
+    source_stat = SPOT_KINDS_LOCAL.stat()
+    source_signature = (source_stat.st_size, source_stat.st_mtime_ns)
+    raw_items = None
+    labels_cache_hit = False
+    if LABELS_CACHE.exists():
         try:
-            raw = SPOT_KINDS_LOCAL.read_text(encoding="utf-16")
+            cached = marshal.loads(LABELS_CACHE.read_bytes())
+            cached_items = cached.get("labels") if isinstance(cached, dict) else None
+            if (isinstance(cached, dict)
+                    and cached.get("signature") == source_signature
+                    and isinstance(cached_items, list)
+                    and all(isinstance(item, dict) for item in cached_items)):
+                raw_items = cached_items
+                labels_cache_hit = True
+        except (OSError, EOFError, TypeError, ValueError) as exc:
+            print(f"⚠️ Labels cache không dùng được, đọc nguồn: {exc}")
+
+    if raw_items is None:
+        try:
+            raw = SPOT_KINDS_LOCAL.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                raw = SPOT_KINDS_LOCAL.read_text(encoding="utf-16")
+            except Exception as e:
+                print(f"⚠️ Đọc file fail: {e}")
+                return {}
+
+        try:
+            raw_items = _parse_spot_kinds_json(raw)
         except Exception as e:
-            print(f"⚠️ Đọc file fail: {e}")
+            print(f"⚠️ Parse lỗi: {e}")
             return {}
 
-    try:
-        raw_items = _parse_spot_kinds_json(raw)
-    except Exception as e:
-        print(f"⚠️ Parse lỗi: {e}")
-        return {}
+        if not raw_items:
+            print("⚠️ Parse OK nhưng 0 label")
+            return {}
 
-    if not raw_items:
-        print(f"⚠️ Parse OK nhưng 0 label")
-        return {}
+        try:
+            LABELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            temp_cache = LABELS_CACHE.with_suffix(".bin.tmp")
+            temp_cache.write_bytes(marshal.dumps({
+                "signature": source_signature,
+                "labels": raw_items,
+            }))
+            temp_cache.replace(LABELS_CACHE)
+        except (OSError, ValueError) as exc:
+            print(f"⚠️ Không lưu được labels cache: {exc}")
 
-    print(f"📂 Parsed {len(raw_items)} label từ spot_kinds.json")
+    if labels_cache_hit:
+        print(f"📦 Labels cache: {len(raw_items)}")
+    else:
+        print(f"📂 Parsed {len(raw_items)} label từ spot_kinds.json")
 
     local_files = {}
     if ICONS_FOLDER.exists():
@@ -385,6 +419,21 @@ def fetch_markers():
     if not SPOT_KINDS_LOCAL.exists():
         raise FileNotFoundError(f"Thiếu file markers: {SPOT_KINDS_LOCAL}")
 
+    source_stat = SPOT_KINDS_LOCAL.stat()
+    source_signature = (source_stat.st_size, source_stat.st_mtime_ns)
+    if MARKERS_CACHE.exists():
+        try:
+            cached = marshal.loads(MARKERS_CACHE.read_bytes())
+            cached_markers = cached.get("markers") if isinstance(cached, dict) else None
+            if (isinstance(cached, dict)
+                    and cached.get("signature") == source_signature
+                    and isinstance(cached_markers, list)
+                    and all(isinstance(marker, dict) for marker in cached_markers)):
+                print(f"📦 Markers cache: {len(cached_markers)} (spot_kinds.json không đổi)")
+                return cached_markers
+        except (OSError, EOFError, TypeError, ValueError) as exc:
+            print(f"⚠️ Markers cache không dùng được, đọc nguồn: {exc}")
+
     try:
         data = json.loads(SPOT_KINDS_LOCAL.read_text(encoding="utf-8-sig"))
     except UnicodeDecodeError:
@@ -401,7 +450,18 @@ def fetch_markers():
     if any(any(field not in marker for field in required_fields) for marker in markers):
         raise ValueError(f"Marker thiếu x_pos, y_pos hoặc label_id trong {SPOT_KINDS_LOCAL}")
 
-    print(f"📂 Markers local: {len(markers)} (spot_kinds.json)")
+    try:
+        MARKERS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        temp_cache = MARKERS_CACHE.with_suffix(".bin.tmp")
+        temp_cache.write_bytes(marshal.dumps({
+            "signature": source_signature,
+            "markers": markers,
+        }))
+        temp_cache.replace(MARKERS_CACHE)
+    except (OSError, ValueError) as exc:
+        print(f"⚠️ Không lưu được markers cache: {exc}")
+
+    print(f"📂 Đọc markers nguồn: {len(markers)} (spot_kinds.json)")
     return markers
 
 
@@ -1398,37 +1458,118 @@ class MapWindow(QWidget):
     def _build_icon_filter_panel(self, icon_map, markers):
         panel = QWidget(self)
         panel.setObjectName("iconFilterPanel")
-        panel.setFixedWidth(320)
+        panel.setFixedWidth(336)
         panel.setStyleSheet("""
-            QWidget#iconFilterPanel { background: #171b24; color: #e8edf5; }
-            QLineEdit, QPushButton {
-                background: #252c36; color: #e8edf5;
-                border: 1px solid #3b4654; border-radius: 4px; padding: 5px;
+            QWidget#iconFilterPanel {
+                background: #111821;
+                color: #e8edf5;
             }
+            QLabel#filterTitle {
+                color: #f3f6fb;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QLabel#filterSubtitle {
+                color: #93a2b5;
+                font-size: 10px;
+            }
+            QLabel#filterStatus {
+                background: #1b2835;
+                color: #b9d8e8;
+                border: 1px solid #2a4050;
+                border-radius: 7px;
+                padding: 8px;
+                font-weight: 600;
+            }
+            QLineEdit {
+                background: #1a232e;
+                color: #f3f6fb;
+                border: 1px solid #303d4b;
+                border-radius: 7px;
+                padding: 9px 10px;
+                selection-background-color: #287c91;
+            }
+            QLineEdit:focus { border-color: #54bfd0; }
+            QPushButton {
+                background: #1c2733;
+                color: #dce5ef;
+                border: 1px solid #344454;
+                border-radius: 7px;
+                padding: 8px 6px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #263545;
+                border-color: #5d8ca0;
+            }
+            QPushButton#showAllButton {
+                background: #174b55;
+                border-color: #267582;
+                color: #e2fbff;
+            }
+            QPushButton#showAllButton:hover { background: #20616c; }
             QToolButton {
-                background: #252c36; color: #e8edf5;
-                border: 1px solid #303947; border-radius: 5px; padding: 2px;
+                background: #1a232e;
+                color: #dce5ef;
+                border: 1px solid #2c3947;
+                border-radius: 7px;
+                padding: 4px 2px;
             }
             QToolButton:checked {
-                background: #354b5d; border-color: #73d7f0;
+                background: #203b47;
+                border: 1px solid #58bdcc;
+                color: #f4fdff;
             }
-            QToolButton:hover { border-color: #90aeca; }
-            QScrollArea { border: none; }
+            QToolButton:hover { border-color: #7898aa; }
+            QToolButton:focus { border: 1px solid #8bd9e4; }
+            QLabel#filterGroupTitle {
+                color: #9eafc1;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 5px 2px 2px;
+            }
+            QWidget#filterGroup {
+                border-bottom: 1px solid #26323e;
+            }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical {
+                background: #151d27;
+                width: 9px;
+                margin: 2px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #3a4b5c;
+                min-height: 28px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover { background: #587186; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
         """)
 
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 14, 10, 10)
+        layout.setSpacing(9)
 
-        title = QLabel("Lọc loại điểm trên bản đồ")
+        title = QLabel("Bộ lọc bản đồ")
+        title.setObjectName("filterTitle")
         layout.addWidget(title)
 
+        subtitle = QLabel("Chọn loại điểm muốn hiển thị")
+        subtitle.setObjectName("filterSubtitle")
+        layout.addWidget(subtitle)
+
         self.icon_filter_status = QLabel()
+        self.icon_filter_status.setObjectName("filterStatus")
         layout.addWidget(self.icon_filter_status)
 
         controls = QHBoxLayout()
-        select_all = QPushButton("Chọn tất cả")
-        clear_all = QPushButton("Bỏ chọn")
+        controls.setSpacing(7)
+        select_all = QPushButton("Hiện tất cả")
+        select_all.setObjectName("showAllButton")
+        clear_all = QPushButton("Ẩn tất cả")
         select_all.clicked.connect(
             lambda: self._set_all_icon_filters(True))
         clear_all.clicked.connect(
@@ -1438,13 +1579,12 @@ class MapWindow(QWidget):
         layout.addLayout(controls)
 
         search = QLineEdit()
-        search.setPlaceholderText("Tìm vật phẩm...")
+        search.setClearButtonEnabled(True)
+        search.setPlaceholderText("Tìm tên hoặc mã loại điểm...")
         search.textChanged.connect(self._filter_icon_buttons)
         search.textChanged.connect(
             lambda text: self._save_filter_search(text))
         saved_search = self.settings.get("filter_search", "")
-        if isinstance(saved_search, str) and saved_search:
-            search.setText(saved_search)
         layout.addWidget(search)
 
         scroll = QScrollArea(panel)
@@ -1471,20 +1611,24 @@ class MapWindow(QWidget):
         grid_layout.setAlignment(Qt.AlignTop)
 
         marker_counts = Counter(marker.label_id for marker in markers)
+        self.icon_filter_marker_counts = marker_counts
         self.icon_filter_buttons = {}
         self.icon_filter_groups = []
         for parent_id, group_items in sorted(
                 groups.items(), key=lambda group: parent_sort_key(group[0])):
             section = QWidget(grid_widget)
+            section.setObjectName("filterGroup")
             section_layout = QVBoxLayout(section)
-            section_layout.setContentsMargins(0, 0, 0, 0)
-            section_layout.setSpacing(2)
-            section_layout.addWidget(QLabel(f"Parent ID: {parent_id}"))
+            section_layout.setContentsMargins(0, 3, 0, 5)
+            section_layout.setSpacing(4)
+            group_title = QLabel(f"NHÓM  {parent_id}")
+            group_title.setObjectName("filterGroupTitle")
+            section_layout.addWidget(group_title)
 
             group_grid = QGridLayout()
             group_grid.setContentsMargins(0, 0, 0, 0)
-            group_grid.setHorizontalSpacing(4)
-            group_grid.setVerticalSpacing(4)
+            group_grid.setHorizontalSpacing(5)
+            group_grid.setVerticalSpacing(5)
             group_label_ids = []
 
             for index, (label_id, info) in enumerate(group_items):
@@ -1496,8 +1640,8 @@ class MapWindow(QWidget):
                 button.setCheckable(True)
                 button.setChecked(label_id in self.visible_label_ids)
                 button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-                button.setIconSize(QSize(34, 34))
-                button.setFixedSize(68, 76)
+                button.setIconSize(QSize(36, 36))
+                button.setFixedSize(70, 82)
                 button.setCursor(Qt.PointingHandCursor)
                 button.setText(f"{display_name}\n{count}")
                 button.setToolTip(
@@ -1509,7 +1653,7 @@ class MapWindow(QWidget):
                     pixmap = QPixmap(str(icon_path))
                     if not pixmap.isNull():
                         button.setIcon(QIcon(pixmap.scaled(
-                            QSize(34, 34), Qt.KeepAspectRatio,
+                            QSize(36, 36), Qt.KeepAspectRatio,
                             Qt.SmoothTransformation)))
 
                 button.toggled.connect(
@@ -1524,6 +1668,9 @@ class MapWindow(QWidget):
             section_layout.addLayout(group_grid)
             grid_layout.addWidget(section)
             self.icon_filter_groups.append((section, group_label_ids))
+
+        if isinstance(saved_search, str) and saved_search:
+            search.setText(saved_search)
 
         grid_layout.addStretch(1)
 
@@ -1575,8 +1722,12 @@ class MapWindow(QWidget):
         selected = sum(
             1 for button, _ in self.icon_filter_buttons.values()
             if button.isChecked())
+        visible_markers = sum(
+            self.icon_filter_marker_counts.get(label_id, 0)
+            for label_id in self.visible_label_ids)
         self.icon_filter_status.setText(
-            f"Đang chọn: {selected}/{len(self.icon_filter_buttons)} loại")
+            f"{selected}/{len(self.icon_filter_buttons)} loại đang bật"
+            f"  ·  {visible_markers:,} điểm")
 
     def refresh_all(self):
         if self.map_widget is None:
